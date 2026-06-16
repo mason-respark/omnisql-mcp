@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from 'events';
 import {
   isAuroraIamConnection,
   parseRegionFromRdsHostname,
@@ -7,9 +8,26 @@ import {
   mintIamAuthToken,
   isIamAuthEnabled,
   getIamAuth,
+  getAwsProfile,
+  runSsoLogin,
+  resolveSsoLoginTimeoutMs,
+  describeAuthRequired,
   IamAuthError,
 } from './iam-auth.js';
 import type { DatabaseConnection } from './types.js';
+
+/** A fake child process that lets a test drive stdout/stderr/close/error events. */
+function fakeChild() {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+    kill: ReturnType<typeof vi.fn>;
+  };
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = vi.fn();
+  return child;
+}
 
 // A plugin-created Aurora IAM connection: no url / no wrapperPlugins persisted,
 // driver = aurora-postgresql, awsProfile lives in the nested `properties` map.
@@ -229,6 +247,96 @@ describe('classifyAwsAuthError', () => {
 
   it('classifies an unknown error as TOKEN_MINT_FAILED', () => {
     expect(classifyAwsAuthError(new Error('connect ETIMEDOUT'))).toBe('TOKEN_MINT_FAILED');
+  });
+});
+
+describe('getAwsProfile', () => {
+  it('returns the profile for an IAM connection', () => {
+    expect(getAwsProfile(pluginConn())).toBe('example-sso-profile');
+  });
+
+  it('returns undefined for a stock connection', () => {
+    expect(getAwsProfile(stockPgConn())).toBeUndefined();
+  });
+});
+
+describe('describeAuthRequired', () => {
+  it('summarizes an AUTH_REQUIRED error for the model to act on', () => {
+    const info = describeAuthRequired(
+      new IamAuthError('AUTH_REQUIRED', 'SSO expired', {
+        profile: 'example-sso-profile',
+        connectionName: 'aurora_pg_prod',
+      })
+    );
+    expect(info.status).toBe('auth_required');
+    expect(info.profile).toBe('example-sso-profile');
+    expect(info.connection).toBe('aurora_pg_prod');
+    expect(info.action).toContain('aws_sso_login');
+  });
+});
+
+describe('resolveSsoLoginTimeoutMs', () => {
+  it('defaults to 180s when unset', () => {
+    expect(resolveSsoLoginTimeoutMs({})).toBe(180_000);
+  });
+
+  it('uses a configured number of seconds', () => {
+    expect(resolveSsoLoginTimeoutMs({ OMNISQL_SSO_LOGIN_TIMEOUT: '30' })).toBe(30_000);
+  });
+
+  it('falls back to the default for a non-numeric or non-positive value', () => {
+    expect(resolveSsoLoginTimeoutMs({ OMNISQL_SSO_LOGIN_TIMEOUT: '180s' })).toBe(180_000);
+    expect(resolveSsoLoginTimeoutMs({ OMNISQL_SSO_LOGIN_TIMEOUT: '0' })).toBe(180_000);
+  });
+});
+
+describe('runSsoLogin', () => {
+  it('resolves with captured output when aws sso login exits 0', async () => {
+    const child = fakeChild();
+    const spawn = vi.fn(() => child) as any;
+
+    const p = runSsoLogin('example-sso-profile', { deps: { spawn } });
+    child.stdout.emit('data', Buffer.from('Attempting to open the SSO authorization page...\n'));
+    child.emit('close', 0);
+
+    await expect(p).resolves.toMatchObject({ output: expect.stringContaining('authorization') });
+    expect(spawn).toHaveBeenCalledWith(
+      'aws',
+      ['sso', 'login', '--profile', 'example-sso-profile'],
+      expect.anything()
+    );
+  });
+
+  it('rejects with AWS_CLI_NOT_FOUND when aws is not installed (ENOENT)', async () => {
+    const child = fakeChild();
+    const spawn = vi.fn(() => child) as any;
+
+    const p = runSsoLogin('example-sso-profile', { deps: { spawn } });
+    const enoent = Object.assign(new Error('spawn aws ENOENT'), { code: 'ENOENT' });
+    child.emit('error', enoent);
+
+    await expect(p).rejects.toMatchObject({ kind: 'AWS_CLI_NOT_FOUND' });
+  });
+
+  it('rejects with LOGIN_FAILED on a non-zero exit', async () => {
+    const child = fakeChild();
+    const spawn = vi.fn(() => child) as any;
+
+    const p = runSsoLogin('example-sso-profile', { deps: { spawn } });
+    child.stderr.emit('data', Buffer.from('could not reach SSO endpoint'));
+    child.emit('close', 1);
+
+    await expect(p).rejects.toMatchObject({ kind: 'LOGIN_FAILED' });
+  });
+
+  it('rejects with LOGIN_TIMEOUT and kills the process when it overruns', async () => {
+    const child = fakeChild();
+    const spawn = vi.fn(() => child) as any;
+
+    const p = runSsoLogin('example-sso-profile', { timeoutMs: 5, deps: { spawn } });
+
+    await expect(p).rejects.toMatchObject({ kind: 'LOGIN_TIMEOUT' });
+    expect(child.kill).toHaveBeenCalled();
   });
 });
 

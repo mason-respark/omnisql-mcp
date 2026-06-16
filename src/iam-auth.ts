@@ -8,6 +8,7 @@
  * error so the query path can surface a "log in or skip" prompt rather than
  * crashing. See docs/superpowers/specs/2026-06-16-mcp-aurora-iam-auth-design.md.
  */
+import { spawn as nodeSpawn } from 'child_process';
 import type { DatabaseConnection } from './types.js';
 
 export type IamAuthErrorKind =
@@ -17,7 +18,8 @@ export type IamAuthErrorKind =
   | 'REGION_UNKNOWN'
   | 'TOKEN_MINT_FAILED'
   | 'AWS_CLI_NOT_FOUND'
-  | 'LOGIN_TIMEOUT';
+  | 'LOGIN_TIMEOUT'
+  | 'LOGIN_FAILED';
 
 export class IamAuthError extends Error {
   readonly kind: IamAuthErrorKind;
@@ -69,6 +71,11 @@ function readString(value: unknown): string | undefined {
 /** The AWS profile is the connector's fingerprint, present in both connection shapes. */
 function awsProfileOf(connection: DatabaseConnection): string | undefined {
   return readString(nestedProps(connection)['awsProfile']);
+}
+
+/** Public accessor for a connection's AWS profile (used to drive `aws sso login`). */
+export function getAwsProfile(connection: DatabaseConnection): string | undefined {
+  return awsProfileOf(connection);
 }
 
 function detectEngine(connection: DatabaseConnection): IamEngine {
@@ -253,4 +260,117 @@ export async function mintIamAuthToken(
           }`;
     throw new IamAuthError(kind, message, { profile: params.profile, cause: error });
   }
+}
+
+export interface AuthRequiredInfo {
+  status: 'auth_required';
+  profile?: string;
+  connection?: string;
+  message: string;
+  action: string;
+}
+
+/**
+ * Describe an AUTH_REQUIRED error as structured guidance the model can act on:
+ * ask the user to log in (via the aws_sso_login tool) or skip, then retry.
+ */
+export function describeAuthRequired(error: IamAuthError): AuthRequiredInfo {
+  const profile = error.profile;
+  const target = profile ? `profile "${profile}"` : 'the connection';
+  return {
+    status: 'auth_required',
+    profile,
+    connection: error.connectionName,
+    message: error.message,
+    action:
+      `The AWS SSO session for ${target} has expired. Ask the user whether to log in or skip. ` +
+      `To log in, call the aws_sso_login tool (with the connectionId or profile), then retry this request.`,
+  };
+}
+
+export type SpawnLike = typeof nodeSpawn;
+
+export interface SsoLoginOptions {
+  timeoutMs?: number;
+  env?: Record<string, string | undefined>;
+  deps?: { spawn: SpawnLike };
+}
+
+export interface SsoLoginResult {
+  profile: string;
+  output: string;
+}
+
+/** Resolve the SSO-login timeout (ms) from OMNISQL_SSO_LOGIN_TIMEOUT (seconds), default 180s. */
+export function resolveSsoLoginTimeoutMs(
+  env: Record<string, string | undefined> = process.env
+): number {
+  const configured = Number(env.OMNISQL_SSO_LOGIN_TIMEOUT);
+  return Number.isFinite(configured) && configured > 0 ? configured * 1000 : 180_000;
+}
+
+/**
+ * Run `aws sso login --profile <profile>`. The AWS CLI opens a browser; this
+ * blocks until it exits (or times out). Rejects with a typed IamAuthError.
+ */
+export function runSsoLogin(profile: string, opts: SsoLoginOptions = {}): Promise<SsoLoginResult> {
+  const spawnFn = opts.deps?.spawn ?? nodeSpawn;
+  const env = opts.env ?? process.env;
+  const timeoutMs = opts.timeoutMs ?? resolveSsoLoginTimeoutMs(env);
+
+  return new Promise<SsoLoginResult>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
+    const child = spawnFn('aws', ['sso', 'login', '--profile', profile], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let output = '';
+    child.stdout?.on('data', (d: Buffer) => (output += d.toString()));
+    child.stderr?.on('data', (d: Buffer) => (output += d.toString()));
+
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(() =>
+        reject(
+          new IamAuthError(
+            'LOGIN_TIMEOUT',
+            `aws sso login for profile "${profile}" timed out after ${timeoutMs}ms.`,
+            { profile }
+          )
+        )
+      );
+    }, timeoutMs);
+
+    child.on('error', (err: NodeJS.ErrnoException) => {
+      const kind = err.code === 'ENOENT' ? 'AWS_CLI_NOT_FOUND' : 'LOGIN_FAILED';
+      const message =
+        kind === 'AWS_CLI_NOT_FOUND'
+          ? 'The AWS CLI ("aws") was not found on PATH; install it to run aws sso login.'
+          : `Failed to run aws sso login for profile "${profile}": ${err.message}`;
+      finish(() => reject(new IamAuthError(kind, message, { profile, cause: err })));
+    });
+
+    child.on('close', (code: number | null) => {
+      finish(() => {
+        if (code === 0) {
+          resolve({ profile, output });
+        } else {
+          reject(
+            new IamAuthError(
+              'LOGIN_FAILED',
+              `aws sso login for profile "${profile}" exited with code ${code}: ${output.trim()}`,
+              { profile }
+            )
+          );
+        }
+      });
+    });
+  });
 }
