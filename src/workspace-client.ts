@@ -21,7 +21,7 @@ import {
   buildListTablesQuery,
   convertToCSV,
 } from './utils.js';
-import { IamAuthError, getIamAuth, mintIamAuthToken } from './iam-auth.js';
+import { IamAuthError, isAuroraIamConnection, getIamAuth, mintIamAuthToken } from './iam-auth.js';
 
 export class WorkspaceClient {
   private timeout: number;
@@ -164,6 +164,7 @@ export class WorkspaceClient {
       fs.writeFileSync(outputFile, content, 'utf-8');
       return { filePath: outputFile, format, result };
     } catch (error) {
+      if (error instanceof IamAuthError) throw error;
       throw new Error(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
@@ -194,6 +195,13 @@ export class WorkspaceClient {
     query: string
   ): Promise<QueryResult> {
     const driver = connection.driver.toLowerCase();
+
+    // Aurora IAM connections created via the bootstrap script have an opaque GUID
+    // driver string; route them by their detected engine so token minting still runs.
+    const iam = isAuroraIamConnection(connection);
+    if (iam.isIam && iam.engine === 'postgres') {
+      return this.executePostgreSQLQuery(connection, query);
+    }
 
     if (driver.includes('sqlite')) {
       return this.executeSQLiteQuery(connection, query);
@@ -314,7 +322,9 @@ export class WorkspaceClient {
         ? (sslHandler?.properties as Record<string, unknown>)?.['sslMode'] || 'require'
         : undefined);
     let sslMode = String(sslModeRaw ?? '').toLowerCase();
-    if (iamForcesSsl && !sslMode) sslMode = 'verify-full';
+    // The IAM token is a credential: always require full TLS verification, overriding
+    // any weaker (or absent) stored sslmode so the token never crosses an unverified channel.
+    if (iamForcesSsl) sslMode = 'verify-full';
     const sslRootCert =
       connection.properties?.['sslrootcert'] ||
       connection.properties?.['ssl.root.cert'] ||
@@ -776,7 +786,9 @@ export class WorkspaceClient {
         connectionTime: Date.now() - startTime,
         serverVersion,
       };
-    } catch {
+    } catch (error) {
+      // An expired SSO session must surface so the caller can re-auth, not look like an empty DB.
+      if (error instanceof IamAuthError) throw error;
       return {
         connectionId: connection.id,
         tableCount: 0,
@@ -805,6 +817,8 @@ export class WorkspaceClient {
         return tableObj;
       });
     } catch (error) {
+      // An expired SSO session must surface so the caller can re-auth, not look like an empty DB.
+      if (error instanceof IamAuthError) throw error;
       if (this.debug) {
         console.error(`Failed to list tables: ${error}`);
       }

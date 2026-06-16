@@ -129,4 +129,61 @@ describe('WorkspaceClient — Aurora IAM auth on the Postgres path', () => {
     expect(mintMock).not.toHaveBeenCalled();
     expect(pgConfigs[0].password).toBe('hunter2');
   });
+
+  it('enforces verify-full TLS for IAM even when a weaker sslmode is configured', async () => {
+    mintMock.mockResolvedValue('minted-token-xyz');
+    const conn = iamConn();
+    (conn.properties as any).sslmode = 'require'; // weaker: encrypt without cert verification
+
+    await client.executeQuery(conn, 'SELECT 1');
+
+    // The IAM token is a credential; it must never go over an unverified channel.
+    expect(pgConfigs[0].ssl).toMatchObject({ rejectUnauthorized: true });
+  });
+
+  it('enforces TLS for IAM even when sslmode=disable is configured', async () => {
+    mintMock.mockResolvedValue('minted-token-xyz');
+    const conn = iamConn();
+    (conn.properties as any).sslmode = 'disable';
+
+    await client.executeQuery(conn, 'SELECT 1');
+
+    expect(pgConfigs[0].ssl).not.toBe(false);
+    expect(pgConfigs[0].ssl).toMatchObject({ rejectUnauthorized: true });
+  });
+
+  it('routes a GUID-driver bootstrap IAM connection to the Postgres path and mints', async () => {
+    mintMock.mockResolvedValue('minted-token-xyz');
+    const conn = iamConn({
+      driver: '27DA594F-326B-45B3-E2BC-637BBCA4777D',
+      url: 'jdbc:aws-wrapper:postgresql://infra.cluster-x.us-east-2.rds.amazonaws.com:5432/postgres',
+    });
+
+    await client.executeQuery(conn, 'SELECT 1');
+
+    expect(mintMock).toHaveBeenCalledTimes(1);
+    expect(pgConfigs[0].password).toBe('minted-token-xyz');
+  });
+
+  it('propagates AUTH_REQUIRED from exportData instead of wrapping it as "Export failed"', async () => {
+    mintMock.mockRejectedValue(new IamAuthError('AUTH_REQUIRED', 'SSO expired', { profile: 'p' }));
+
+    const err = await client.exportData(iamConn(), 'SELECT 1', { format: 'csv' }).catch((e) => e);
+    expect(err).toBeInstanceOf(IamAuthError);
+    expect(err.kind).toBe('AUTH_REQUIRED');
+  });
+
+  it('propagates AUTH_REQUIRED from listTables instead of returning an empty array', async () => {
+    mintMock.mockRejectedValue(new IamAuthError('AUTH_REQUIRED', 'SSO expired', { profile: 'p' }));
+
+    const err = await client.listTables(iamConn()).catch((e) => e);
+    expect(err).toBeInstanceOf(IamAuthError);
+  });
+
+  it('propagates AUTH_REQUIRED from getDatabaseStats instead of returning zeroed stats', async () => {
+    mintMock.mockRejectedValue(new IamAuthError('AUTH_REQUIRED', 'SSO expired', { profile: 'p' }));
+
+    const err = await client.getDatabaseStats(iamConn()).catch((e) => e);
+    expect(err).toBeInstanceOf(IamAuthError);
+  });
 });
