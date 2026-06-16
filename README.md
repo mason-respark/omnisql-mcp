@@ -17,6 +17,8 @@ Universal database MCP server — give AI assistants read/write access to your d
 **Postgres-compatible** (routed through `pg` driver automatically):
 - CockroachDB, TimescaleDB, Amazon Redshift, YugabyteDB, AlloyDB, Supabase, Neon, Citus
 
+**Amazon Aurora with AWS IAM / SSO auth**: Aurora PostgreSQL connections that authenticate via AWS IAM are detected automatically and connected using short-lived RDS auth tokens — no stored password. See [AWS IAM Authentication](#aws-iam-authentication-aurora).
+
 **Other databases**: Fall back to an external CLI configured via `OMNISQL_CLI_PATH`. Results vary by CLI.
 
 ## Features
@@ -27,6 +29,7 @@ Universal database MCP server — give AI assistants read/write access to your d
 - Transaction support (BEGIN/COMMIT/ROLLBACK)
 - Query execution plan analysis (EXPLAIN)
 - Schema comparison between connections with migration script generation
+- Native AWS IAM / SSO authentication for Amazon Aurora — mints short-lived RDS tokens automatically, and prompts to refresh an expired SSO session instead of failing
 - Read-only mode with enforced SELECT-only on `execute_query`
 - Connection whitelist to restrict which databases are accessible
 - Tool filtering to disable specific operations
@@ -106,6 +109,10 @@ Add to Cursor Settings > MCP Servers:
 | `OMNISQL_POOL_ACQUIRE_TIMEOUT` | Connection acquire timeout (ms) | `10000` |
 | `OMNISQL_OUTPUT_DIR` | Allow-root for `export_data` `outputPath` writes | `os.tmpdir()` |
 | `OMNISQL_ALLOW_ANY_OUTPUT_PATH` | Disable the allow-root check for `outputPath` | `false` |
+| `OMNISQL_IAM_AUTH` | Enable AWS IAM auth for Aurora connections | `true` |
+| `OMNISQL_SSO_LOGIN_TIMEOUT` | Seconds the `aws_sso_login` tool waits for browser login | `180` |
+
+> All `OMNISQL_*` variables also accept the legacy `DBEAVER_*` prefix (e.g. `DBEAVER_WORKSPACE`) for backward compatibility. `OMNISQL_*` takes precedence when both are set.
 
 ### Read-Only Mode
 
@@ -186,6 +193,9 @@ Restrict which workspace connections are visible. Accepts connection IDs or disp
 - `compare_schemas` - Compare schemas between two connections
 - `get_pool_stats` - Get connection pool statistics
 
+### AWS IAM (Aurora)
+- `aws_sso_login` - Refresh an expired AWS SSO session for an Aurora IAM connection (runs `aws sso login`, opens the browser), then retry the original query
+
 ### Other
 - `get_database_stats` - Database statistics
 - `append_insight` - Store analysis notes
@@ -208,10 +218,21 @@ Supports both configuration formats written by DBeaver-compatible DB clients:
 
 Credentials are automatically decrypted from the workspace `credentials-config.json`.
 
+## AWS IAM Authentication (Aurora)
+
+Amazon Aurora connections that use **AWS IAM database authentication** carry no stored password — the password is a short-lived token minted from an AWS profile, and the underlying AWS SSO session may need an interactive refresh. This server handles that natively:
+
+- **Detection** — a connection is treated as Aurora IAM when its driver properties carry an `awsProfile` (as written by the Aurora IAM connection wizard). No extra MCP configuration needed.
+- **Silent token minting** — when a valid AWS/SSO session exists, the server mints a fresh RDS IAM auth token (via `@aws-sdk/rds-signer`) and connects over `verify-full` TLS using the connection's CA bundle. No prompt.
+- **Expired session** — instead of failing, a query returns a structured `auth_required` result. The assistant asks you to log in or skip; on approval it calls the `aws_sso_login` tool (which runs `aws sso login --profile <profile>`, opening your browser), then retries the query.
+- Works for both ad-hoc queries and pooled/transactional connections — the pool re-mints per physical connection as the ~15-minute token rotates.
+
+**Requirements**: the [AWS CLI](https://aws.amazon.com/cli/) (for `aws sso login`) and an AWS profile configured for the connection. The token is always sent over fully-verified TLS. Set `OMNISQL_IAM_AUTH=false` to disable. Currently supports **Aurora PostgreSQL**.
+
 ## Development
 
 ```bash
-git clone https://github.com/srthkdev/omnisql-mcp.git
+git clone https://github.com/mason-respark/omnisql-mcp.git
 cd omnisql-mcp
 npm install
 npm run build
