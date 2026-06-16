@@ -5,7 +5,24 @@ import {
   sanitizeConnectionId,
   sanitizeIdentifier,
   getTestQuery,
+  readPrefixedEnv,
 } from '../src/utils.js';
+
+describe('readPrefixedEnv', () => {
+  it('prefers the OMNISQL_ variable', () => {
+    expect(readPrefixedEnv('WORKSPACE', { OMNISQL_WORKSPACE: '/o', DBEAVER_WORKSPACE: '/d' })).toBe(
+      '/o'
+    );
+  });
+
+  it('falls back to the legacy DBEAVER_ variable', () => {
+    expect(readPrefixedEnv('WORKSPACE', { DBEAVER_WORKSPACE: '/d' })).toBe('/d');
+  });
+
+  it('returns undefined when neither is set', () => {
+    expect(readPrefixedEnv('WORKSPACE', {})).toBeUndefined();
+  });
+});
 
 describe('validateQuery', () => {
   it('should allow SELECT queries', () => {

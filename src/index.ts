@@ -20,7 +20,9 @@ import {
   convertToCSV,
   redactConnection,
   redactArgs,
+  readPrefixedEnv,
 } from './utils.js';
+import { IamAuthError, describeAuthRequired, runSsoLogin, getAwsProfile } from './iam-auth.js';
 import { ConnectionPoolManager } from './pools/index.js';
 import { TransactionManager } from './managers/index.js';
 import { buildExplainQuery, parseExplainOutput } from './utils/query-analyzer.js';
@@ -75,23 +77,23 @@ class OmniSQLMCPServer {
   private allowAnyOutputPath: boolean;
 
   constructor() {
-    this.debug = process.env.OMNISQL_DEBUG === 'true';
-    this.readOnly = process.env.OMNISQL_READ_ONLY === 'true';
-    this.disabledTools = (process.env.OMNISQL_DISABLED_TOOLS || '')
+    this.debug = readPrefixedEnv('DEBUG') === 'true';
+    this.readOnly = readPrefixedEnv('READ_ONLY') === 'true';
+    this.disabledTools = (readPrefixedEnv('DISABLED_TOOLS') || '')
       .split(',')
       .map((t) => t.trim())
       .filter(Boolean);
 
     // Parse allowed connections whitelist
-    const allowedRaw = process.env.OMNISQL_ALLOWED_CONNECTIONS || '';
+    const allowedRaw = readPrefixedEnv('ALLOWED_CONNECTIONS') || '';
     const allowedList = allowedRaw
       .split(',')
       .map((c) => c.trim())
       .filter(Boolean);
     this.allowedConnections = allowedList.length > 0 ? new Set(allowedList) : null;
 
-    this.outputDir = path.resolve(process.env.OMNISQL_OUTPUT_DIR || os.tmpdir());
-    this.allowAnyOutputPath = process.env.OMNISQL_ALLOW_ANY_OUTPUT_PATH === 'true';
+    this.outputDir = path.resolve(readPrefixedEnv('OUTPUT_DIR') || os.tmpdir());
+    this.allowAnyOutputPath = readPrefixedEnv('ALLOW_ANY_OUTPUT_PATH') === 'true';
 
     this.insightsFile = path.join(os.tmpdir(), 'omnisql-mcp-insights.json');
 
@@ -110,25 +112,25 @@ class OmniSQLMCPServer {
 
     this.configParser = new WorkspaceConfigParser({
       debug: this.debug,
-      timeout: parseInt(process.env.OMNISQL_TIMEOUT || '30000'),
-      executablePath: process.env.OMNISQL_CLI_PATH,
-      workspacePath: process.env.OMNISQL_WORKSPACE,
+      timeout: parseInt(readPrefixedEnv('TIMEOUT') || '30000'),
+      executablePath: readPrefixedEnv('CLI_PATH'),
+      workspacePath: readPrefixedEnv('WORKSPACE'),
     });
 
     this.workspaceClient = new WorkspaceClient(
-      process.env.OMNISQL_CLI_PATH,
-      parseInt(process.env.OMNISQL_TIMEOUT || '30000'),
+      readPrefixedEnv('CLI_PATH'),
+      parseInt(readPrefixedEnv('TIMEOUT') || '30000'),
       this.debug,
-      process.env.OMNISQL_WORKSPACE || this.configParser.getWorkspacePath()
+      readPrefixedEnv('WORKSPACE') || this.configParser.getWorkspacePath()
     );
 
     // Initialize connection pool and transaction manager
     this.poolManager = new ConnectionPoolManager(
       {
-        min: parseInt(process.env.OMNISQL_POOL_MIN || '2'),
-        max: parseInt(process.env.OMNISQL_POOL_MAX || '10'),
-        idleTimeoutMs: parseInt(process.env.OMNISQL_POOL_IDLE_TIMEOUT || '30000'),
-        acquireTimeoutMs: parseInt(process.env.OMNISQL_POOL_ACQUIRE_TIMEOUT || '10000'),
+        min: parseInt(readPrefixedEnv('POOL_MIN') || '2'),
+        max: parseInt(readPrefixedEnv('POOL_MAX') || '10'),
+        idleTimeoutMs: parseInt(readPrefixedEnv('POOL_IDLE_TIMEOUT') || '30000'),
+        acquireTimeoutMs: parseInt(readPrefixedEnv('POOL_ACQUIRE_TIMEOUT') || '10000'),
       },
       this.debug
     );
@@ -759,6 +761,27 @@ class OmniSQLMCPServer {
             required: ['connectionId'],
           },
         },
+        {
+          name: 'aws_sso_login',
+          description:
+            'Refresh an expired AWS SSO session for an Aurora IAM connection by running `aws sso login`. ' +
+            'Opens a browser and blocks until login completes. Call this when a query returns ' +
+            'status "auth_required", after confirming with the user, then retry the original query.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              connectionId: {
+                type: 'string',
+                description:
+                  'The IAM connection whose AWS profile to log in. Either connectionId or profile is required.',
+              },
+              profile: {
+                type: 'string',
+                description: 'AWS profile name to log in. Takes precedence over connectionId.',
+              },
+            },
+          },
+        },
       ];
 
       // Filter tools based on read-only mode and disabled tools
@@ -944,11 +967,27 @@ class OmniSQLMCPServer {
           case 'get_pool_stats':
             return await this.handleGetPoolStats(args as { connectionId: string });
 
+          // AWS IAM auth
+          case 'aws_sso_login':
+            return await this.handleAwsSsoLogin(
+              args as { connectionId?: string; profile?: string }
+            );
+
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
         }
       } catch (error: any) {
         this.log(`Tool execution failed: ${error}`, 'error');
+
+        // An expired AWS SSO session is recoverable: return structured guidance so
+        // the model can prompt the user to log in (aws_sso_login) or skip, then retry.
+        if (error instanceof IamAuthError && error.kind === 'AUTH_REQUIRED') {
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(describeAuthRequired(error), null, 2) },
+            ],
+          };
+        }
 
         if (error instanceof McpError) {
           throw error;
@@ -1733,6 +1772,44 @@ class OmniSQLMCPServer {
         {
           type: 'text' as const,
           text: JSON.stringify(stats, null, 2),
+        },
+      ],
+    };
+  }
+
+  private async handleAwsSsoLogin(args: { connectionId?: string; profile?: string }) {
+    let profile = args.profile?.trim();
+
+    if (!profile && args.connectionId) {
+      const connection = await this.getConnection(sanitizeConnectionId(args.connectionId));
+      if (!connection) {
+        throw new McpError(ErrorCode.InvalidParams, `Connection not found: ${args.connectionId}`);
+      }
+      profile = getAwsProfile(connection);
+      if (!profile) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Connection "${connection.name}" is not an Aurora IAM connection (no AWS profile to log in).`
+        );
+      }
+    }
+
+    if (!profile) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'aws_sso_login requires either a profile or an IAM connectionId.'
+      );
+    }
+
+    // Throws a typed IamAuthError (AWS_CLI_NOT_FOUND / LOGIN_FAILED / LOGIN_TIMEOUT)
+    // on failure, surfaced to the client by the central handler.
+    await runSsoLogin(profile);
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `AWS SSO login succeeded for profile "${profile}". Retry the original query now.`,
         },
       ],
     };

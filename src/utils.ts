@@ -1,3 +1,27 @@
+import type { DatabaseConnection } from './types.js';
+
+/**
+ * DBeaver's workspace JSON config nests driver-level properties under a
+ * `properties` key, which the config parser spreads into
+ * `connection.properties.properties`. Returns that nested map (or {}).
+ */
+export function getNestedDriverProps(connection: DatabaseConnection): Record<string, unknown> {
+  const nested = connection.properties?.['properties'];
+  return nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : {};
+}
+
+/**
+ * Read a config value, preferring the `OMNISQL_<suffix>` variable and falling
+ * back to the legacy `DBEAVER_<suffix>` name (this server was renamed from
+ * dbeaver-mcp-server, and existing configs still use the DBEAVER_ prefix).
+ */
+export function readPrefixedEnv(
+  suffix: string,
+  env: Record<string, string | undefined> = process.env
+): string | undefined {
+  return env[`OMNISQL_${suffix}`] ?? env[`DBEAVER_${suffix}`];
+}
+
 /**
  * Resolve the DB client CLI executable path.
  *
@@ -6,7 +30,7 @@
  * Returns an empty string when not configured; callers must handle this case.
  */
 export function findCliExecutable(): string {
-  return process.env.OMNISQL_CLI_PATH ?? '';
+  return readPrefixedEnv('CLI_PATH') ?? '';
 }
 
 /**

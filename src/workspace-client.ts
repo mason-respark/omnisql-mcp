@@ -20,7 +20,9 @@ import {
   buildSchemaQuery,
   buildListTablesQuery,
   convertToCSV,
+  getNestedDriverProps,
 } from './utils.js';
+import { IamAuthError, isAuroraIamConnection, getIamAuth, mintIamAuthToken } from './iam-auth.js';
 
 export class WorkspaceClient {
   private timeout: number;
@@ -49,6 +51,9 @@ export class WorkspaceClient {
       result.executionTime = Date.now() - startTime;
       return result;
     } catch (error) {
+      // Preserve typed IAM auth errors (e.g. AUTH_REQUIRED) so the tool layer can
+      // surface a structured "log in or skip" prompt instead of a generic failure.
+      if (error instanceof IamAuthError) throw error;
       const messageRaw = error instanceof Error ? error.message : String(error);
       const code =
         error && typeof error === 'object' && 'code' in error
@@ -160,6 +165,7 @@ export class WorkspaceClient {
       fs.writeFileSync(outputFile, content, 'utf-8');
       return { filePath: outputFile, format, result };
     } catch (error) {
+      if (error instanceof IamAuthError) throw error;
       throw new Error(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
@@ -190,6 +196,13 @@ export class WorkspaceClient {
     query: string
   ): Promise<QueryResult> {
     const driver = connection.driver.toLowerCase();
+
+    // Aurora IAM connections created via the bootstrap script have an opaque GUID
+    // driver string; route them by their detected engine so token minting still runs.
+    const iam = isAuroraIamConnection(connection);
+    if (iam.isIam && iam.engine === 'postgres') {
+      return this.executePostgreSQLQuery(connection, query);
+    }
 
     if (driver.includes('sqlite')) {
       return this.executeSQLiteQuery(connection, query);
@@ -278,13 +291,24 @@ export class WorkspaceClient {
       (connection.properties?.port ? parseInt(connection.properties.port) : 5432);
     const database = connection.database || connection.properties?.database || 'postgres';
     const user = connection.user || connection.properties?.user || process.env.PGUSER || 'postgres';
-    const password = connection.properties?.password || process.env.PGPASSWORD;
+    let password = connection.properties?.password || process.env.PGPASSWORD;
+
+    // Aurora IAM auth: when no password is stored, mint a short-lived RDS IAM token
+    // from the connection's AWS profile. RDS requires TLS, and the plugin-shape
+    // connection persists no sslmode, so force verify-full with the resolved CA bundle.
+    const iamParams = getIamAuth(connection);
+    let iamSslRootCert: string | undefined;
+    let iamForcesSsl = false;
+    if (iamParams) {
+      password = await mintIamAuthToken(iamParams);
+      iamSslRootCert = iamParams.sslRootCert;
+      iamForcesSsl = true;
+    }
 
     // SSL handling
     // The workspace JSON config format stores driver properties under a nested `properties` key,
     // and SSL handler config under `handlers.postgre_ssl`. Check all locations.
-    const nestedProps =
-      (connection.properties?.['properties'] as unknown as Record<string, unknown>) || {};
+    const nestedProps = getNestedDriverProps(connection);
     const sslHandler = (
       connection.properties?.['handlers'] as unknown as Record<string, unknown> | undefined
     )?.['postgre_ssl'] as Record<string, unknown> | undefined;
@@ -297,11 +321,15 @@ export class WorkspaceClient {
       (sslHandler?.enabled
         ? (sslHandler?.properties as Record<string, unknown>)?.['sslMode'] || 'require'
         : undefined);
-    const sslMode = String(sslModeRaw ?? '').toLowerCase();
+    let sslMode = String(sslModeRaw ?? '').toLowerCase();
+    // The IAM token is a credential: always require full TLS verification, overriding
+    // any weaker (or absent) stored sslmode so the token never crosses an unverified channel.
+    if (iamForcesSsl) sslMode = 'verify-full';
     const sslRootCert =
       connection.properties?.['sslrootcert'] ||
       connection.properties?.['ssl.root.cert'] ||
-      connection.properties?.['sslRootCert'];
+      connection.properties?.['sslRootCert'] ||
+      iamSslRootCert;
     const sslCert =
       connection.properties?.['sslcert'] ||
       connection.properties?.['ssl.cert'] ||
@@ -575,8 +603,7 @@ export class WorkspaceClient {
 
     // ClickHouse SSL config may live at properties.ssl, nested properties.properties.ssl,
     // the legacy `ssl.mode`, or the `clickhouse-ssl` handler block.
-    const nestedProps =
-      (connection.properties?.['properties'] as unknown as Record<string, unknown>) || {};
+    const nestedProps = getNestedDriverProps(connection);
     const sslHandler = (
       connection.properties?.['handlers'] as unknown as Record<string, unknown> | undefined
     )?.['clickhouse-ssl'] as Record<string, unknown> | undefined;
@@ -758,7 +785,9 @@ export class WorkspaceClient {
         connectionTime: Date.now() - startTime,
         serverVersion,
       };
-    } catch {
+    } catch (error) {
+      // An expired SSO session must surface so the caller can re-auth, not look like an empty DB.
+      if (error instanceof IamAuthError) throw error;
       return {
         connectionId: connection.id,
         tableCount: 0,
@@ -787,6 +816,8 @@ export class WorkspaceClient {
         return tableObj;
       });
     } catch (error) {
+      // An expired SSO session must surface so the caller can re-auth, not look like an empty DB.
+      if (error instanceof IamAuthError) throw error;
       if (this.debug) {
         console.error(`Failed to list tables: ${error}`);
       }

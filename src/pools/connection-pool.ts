@@ -1,7 +1,10 @@
+import fs from 'fs';
 import { Pool as PgPool } from 'pg';
 import mysql, { Pool as MySqlPool } from 'mysql2/promise';
 import sql, { ConnectionPool as MssqlPool } from 'mssql';
 import { DatabaseConnection, PoolConfig, PoolStats } from '../types.js';
+import { getIamAuth, mintIamAuthToken } from '../iam-auth.js';
+import { getNestedDriverProps } from '../utils.js';
 
 const DEFAULT_POOL_CONFIG: PoolConfig = {
   min: 2,
@@ -15,6 +18,17 @@ interface PoolEntry {
   type: 'postgres' | 'mysql' | 'mssql';
   config: PoolConfig;
   createdAt: Date;
+}
+
+/** TLS config for an Aurora IAM pool: verify-full, with the RDS CA bundle when present. */
+function buildIamSslConfig(sslRootCert?: string): {
+  ssl: { rejectUnauthorized: boolean; ca?: string };
+} {
+  const ssl: { rejectUnauthorized: boolean; ca?: string } = { rejectUnauthorized: true };
+  if (sslRootCert && fs.existsSync(sslRootCert)) {
+    ssl.ca = fs.readFileSync(sslRootCert).toString();
+  }
+  return { ssl };
 }
 
 export class ConnectionPoolManager {
@@ -102,14 +116,20 @@ export class ConnectionPoolManager {
   private async createPostgresPool(connection: DatabaseConnection): Promise<PoolEntry> {
     this.log(`Creating PostgreSQL pool for ${connection.name}`);
 
-    const sslConfig = this.getPostgresSslConfig(connection);
+    // Aurora IAM connections mint a fresh token per physical connection (pg calls
+    // the password function on each new connection), so a long-lived pool keeps
+    // working as the ~15-minute token rotates. RDS requires TLS.
+    const iamParams = getIamAuth(connection);
+    const sslConfig = iamParams
+      ? buildIamSslConfig(iamParams.sslRootCert)
+      : this.getPostgresSslConfig(connection);
 
     const pool = new PgPool({
       host: connection.host,
       port: connection.port || 5432,
       database: connection.database,
       user: connection.user,
-      password: connection.properties?.password,
+      password: iamParams ? () => mintIamAuthToken(iamParams) : connection.properties?.password,
       min: this.config.min,
       max: this.config.max,
       idleTimeoutMillis: this.config.idleTimeoutMs,
@@ -132,7 +152,7 @@ export class ConnectionPoolManager {
     const props = connection.properties || {};
     // The workspace JSON config format stores driver properties under a nested `properties` key,
     // and SSL handler config under `handlers.postgre_ssl`. Check all locations.
-    const nestedProps = (props.properties as unknown as Record<string, unknown>) || {};
+    const nestedProps = getNestedDriverProps(connection);
     const sslHandler = (props.handlers as unknown as Record<string, unknown> | undefined)?.[
       'postgre_ssl'
     ] as Record<string, unknown> | undefined;

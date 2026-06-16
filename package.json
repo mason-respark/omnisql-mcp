@@ -69,6 +69,8 @@
   "author": "Sarthak Jain",
   "license": "MIT",
   "dependencies": {
+    "@aws-sdk/credential-providers": "^3.1070.0",
+    "@aws-sdk/rds-signer": "^3.1070.0",
     "@modelcontextprotocol/sdk": "^1.25.2",
     "csv-parser": "^3.0.0",
     "csv-stringify": "^6.4.6",
