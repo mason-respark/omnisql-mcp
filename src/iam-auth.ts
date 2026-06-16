@@ -10,6 +10,7 @@
  */
 import { spawn as nodeSpawn } from 'child_process';
 import type { DatabaseConnection } from './types.js';
+import { getNestedDriverProps } from './utils.js';
 
 export type IamAuthErrorKind =
   | 'AUTH_REQUIRED'
@@ -51,31 +52,18 @@ export interface IamConnectionParams {
   sslRootCert?: string;
 }
 
-/**
- * The driver-level properties DBeaver stores under the nested `properties` key
- * of a connection's configuration. The MCP's config-parser spreads the parsed
- * config into `connection.properties`, so this nested map lands at
- * `connection.properties.properties`.
- */
-function nestedProps(connection: DatabaseConnection): Record<string, unknown> {
-  const nested = connection.properties?.['properties'];
-  return nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : {};
-}
-
 function readString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-/** The AWS profile is the connector's fingerprint, present in both connection shapes. */
-function awsProfileOf(connection: DatabaseConnection): string | undefined {
-  return readString(nestedProps(connection)['awsProfile']);
-}
-
-/** Public accessor for a connection's AWS profile (used to drive `aws sso login`). */
+/**
+ * A connection's AWS profile — the connector's fingerprint, present in both
+ * connection shapes, and the value used to drive `aws sso login`.
+ */
 export function getAwsProfile(connection: DatabaseConnection): string | undefined {
-  return awsProfileOf(connection);
+  return readString(getNestedDriverProps(connection)['awsProfile']);
 }
 
 function detectEngine(connection: DatabaseConnection): IamEngine {
@@ -96,7 +84,7 @@ export function isAuroraIamConnection(connection: DatabaseConnection): {
   isIam: boolean;
   engine: IamEngine | null;
 } {
-  if (!awsProfileOf(connection)) return { isIam: false, engine: null };
+  if (!getAwsProfile(connection)) return { isIam: false, engine: null };
   return { isIam: true, engine: detectEngine(connection) };
 }
 
@@ -110,9 +98,9 @@ export function parseRegionFromRdsHostname(host: string): string | null {
 
 /** Resolve everything needed to mint a token and connect, or throw a typed IamAuthError. */
 export function resolveIamConnectionParams(connection: DatabaseConnection): IamConnectionParams {
-  const nested = nestedProps(connection);
+  const nested = getNestedDriverProps(connection);
 
-  const profile = awsProfileOf(connection);
+  const profile = getAwsProfile(connection);
   if (!profile) {
     throw new IamAuthError(
       'PROFILE_NOT_FOUND',
@@ -202,32 +190,20 @@ export function classifyAwsAuthError(error: unknown): IamAuthErrorKind {
   return 'TOKEN_MINT_FAILED';
 }
 
-export interface RdsSignerOptions {
-  hostname: string;
-  port: number;
-  username: string;
-  region: string;
-  credentials: unknown;
-}
+/** Test seam: mint the token directly, bypassing the AWS SDK. */
+export type MintTokenOverride = (params: IamConnectionParams) => Promise<string>;
 
-export interface IamAuthDeps {
-  loadCredentials: (profile: string) => unknown | Promise<unknown>;
-  createSigner: (
-    opts: RdsSignerOptions
-  ) => { getAuthToken: () => Promise<string> } | Promise<{ getAuthToken: () => Promise<string> }>;
-}
-
-function defaultIamAuthDeps(): IamAuthDeps {
-  return {
-    loadCredentials: async (profile) => {
-      const { fromIni } = await import('@aws-sdk/credential-providers');
-      return fromIni({ profile });
-    },
-    createSigner: async (opts) => {
-      const { Signer } = await import('@aws-sdk/rds-signer');
-      return new Signer(opts as unknown as ConstructorParameters<typeof Signer>[0]);
-    },
-  };
+async function defaultMintToken(params: IamConnectionParams): Promise<string> {
+  const { fromIni } = await import('@aws-sdk/credential-providers');
+  const { Signer } = await import('@aws-sdk/rds-signer');
+  const signer = new Signer({
+    hostname: params.host,
+    port: params.port,
+    username: params.username,
+    region: params.region,
+    credentials: fromIni({ profile: params.profile }),
+  });
+  return signer.getAuthToken();
 }
 
 /**
@@ -237,18 +213,10 @@ function defaultIamAuthDeps(): IamAuthDeps {
  */
 export async function mintIamAuthToken(
   params: IamConnectionParams,
-  deps: IamAuthDeps = defaultIamAuthDeps()
+  mint: MintTokenOverride = defaultMintToken
 ): Promise<string> {
   try {
-    const credentials = await deps.loadCredentials(params.profile);
-    const signer = await deps.createSigner({
-      hostname: params.host,
-      port: params.port,
-      username: params.username,
-      region: params.region,
-      credentials,
-    });
-    return await signer.getAuthToken();
+    return await mint(params);
   } catch (error) {
     if (error instanceof IamAuthError) throw error;
     const kind = classifyAwsAuthError(error);

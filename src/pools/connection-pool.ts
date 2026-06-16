@@ -4,6 +4,7 @@ import mysql, { Pool as MySqlPool } from 'mysql2/promise';
 import sql, { ConnectionPool as MssqlPool } from 'mssql';
 import { DatabaseConnection, PoolConfig, PoolStats } from '../types.js';
 import { getIamAuth, mintIamAuthToken } from '../iam-auth.js';
+import { getNestedDriverProps } from '../utils.js';
 
 const DEFAULT_POOL_CONFIG: PoolConfig = {
   min: 2,
@@ -151,7 +152,7 @@ export class ConnectionPoolManager {
     const props = connection.properties || {};
     // The workspace JSON config format stores driver properties under a nested `properties` key,
     // and SSL handler config under `handlers.postgre_ssl`. Check all locations.
-    const nestedProps = (props.properties as unknown as Record<string, unknown>) || {};
+    const nestedProps = getNestedDriverProps(connection);
     const sslHandler = (props.handlers as unknown as Record<string, unknown> | undefined)?.[
       'postgre_ssl'
     ] as Record<string, unknown> | undefined;

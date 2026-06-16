@@ -393,77 +393,43 @@ describe('mintIamAuthToken', () => {
     username: 'app_user',
   };
 
-  it('returns the token produced by the signer', async () => {
-    const token = await mintIamAuthToken(params, {
-      loadCredentials: () => ({ accessKeyId: 'AK', secretAccessKey: 'SK' }) as any,
-      createSigner: (opts) => {
-        expect(opts.hostname).toBe(params.host);
-        expect(opts.username).toBe(params.username);
-        expect(opts.region).toBe(params.region);
-        return { getAuthToken: async () => 'minted-token-123' };
-      },
+  it('returns the token produced by the minter, passing the resolved params', async () => {
+    const token = await mintIamAuthToken(params, async (p) => {
+      expect(p.host).toBe(params.host);
+      expect(p.username).toBe(params.username);
+      expect(p.region).toBe(params.region);
+      return 'minted-token-123';
     });
     expect(token).toBe('minted-token-123');
   });
 
   it('raises an AUTH_REQUIRED IamAuthError when the SSO session is expired', async () => {
     await expect(
-      mintIamAuthToken(params, {
-        loadCredentials: () => {
-          throw new Error('Token is expired and refresh failed');
-        },
-        createSigner: () => ({ getAuthToken: async () => 'never' }),
-      })
-    ).rejects.toMatchObject({ kind: 'AUTH_REQUIRED', profile: 'example-sso-profile' });
-  });
-
-  it('classifies an SSO error thrown from getAuthToken (the real lazy-credential path) as AUTH_REQUIRED', async () => {
-    await expect(
-      mintIamAuthToken(params, {
-        loadCredentials: () => ({ accessKeyId: 'AK', secretAccessKey: 'SK' }) as any,
-        createSigner: () => ({
-          getAuthToken: async () => {
-            throw new Error(
-              'The SSO session associated with this profile has expired or is otherwise invalid.'
-            );
-          },
-        }),
+      mintIamAuthToken(params, async () => {
+        throw new Error('Token is expired and refresh failed');
       })
     ).rejects.toMatchObject({ kind: 'AUTH_REQUIRED', profile: 'example-sso-profile' });
   });
 
   it('does not misclassify an unrelated certificate-expiry error as AUTH_REQUIRED', async () => {
     await expect(
-      mintIamAuthToken(params, {
-        loadCredentials: () => ({ accessKeyId: 'AK', secretAccessKey: 'SK' }) as any,
-        createSigner: () => ({
-          getAuthToken: async () => {
-            throw new Error('certificate has expired');
-          },
-        }),
+      mintIamAuthToken(params, async () => {
+        throw new Error('certificate has expired');
       })
     ).rejects.toMatchObject({ kind: 'TOKEN_MINT_FAILED' });
   });
 
-  it('raises a TOKEN_MINT_FAILED IamAuthError when the signer fails for an unrelated reason', async () => {
+  it('raises a TOKEN_MINT_FAILED IamAuthError when minting fails for an unrelated reason', async () => {
     await expect(
-      mintIamAuthToken(params, {
-        loadCredentials: () => ({ accessKeyId: 'AK', secretAccessKey: 'SK' }) as any,
-        createSigner: () => ({
-          getAuthToken: async () => {
-            throw new Error('network unreachable');
-          },
-        }),
+      mintIamAuthToken(params, async () => {
+        throw new Error('network unreachable');
       })
     ).rejects.toMatchObject({ kind: 'TOKEN_MINT_FAILED' });
   });
 
   it('produces an IamAuthError instance', async () => {
-    const err = await mintIamAuthToken(params, {
-      loadCredentials: () => {
-        throw new Error('Token is expired');
-      },
-      createSigner: () => ({ getAuthToken: async () => 'x' }),
+    const err = await mintIamAuthToken(params, async () => {
+      throw new Error('Token is expired');
     }).catch((e) => e);
     expect(err).toBeInstanceOf(IamAuthError);
   });

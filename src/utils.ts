@@ -1,3 +1,15 @@
+import type { DatabaseConnection } from './types.js';
+
+/**
+ * DBeaver's workspace JSON config nests driver-level properties under a
+ * `properties` key, which the config parser spreads into
+ * `connection.properties.properties`. Returns that nested map (or {}).
+ */
+export function getNestedDriverProps(connection: DatabaseConnection): Record<string, unknown> {
+  const nested = connection.properties?.['properties'];
+  return nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : {};
+}
+
 /**
  * Resolve the DB client CLI executable path.
  *

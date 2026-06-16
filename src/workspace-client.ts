@@ -20,6 +20,7 @@ import {
   buildSchemaQuery,
   buildListTablesQuery,
   convertToCSV,
+  getNestedDriverProps,
 } from './utils.js';
 import { IamAuthError, isAuroraIamConnection, getIamAuth, mintIamAuthToken } from './iam-auth.js';
 
@@ -307,8 +308,7 @@ export class WorkspaceClient {
     // SSL handling
     // The workspace JSON config format stores driver properties under a nested `properties` key,
     // and SSL handler config under `handlers.postgre_ssl`. Check all locations.
-    const nestedProps =
-      (connection.properties?.['properties'] as unknown as Record<string, unknown>) || {};
+    const nestedProps = getNestedDriverProps(connection);
     const sslHandler = (
       connection.properties?.['handlers'] as unknown as Record<string, unknown> | undefined
     )?.['postgre_ssl'] as Record<string, unknown> | undefined;
@@ -603,8 +603,7 @@ export class WorkspaceClient {
 
     // ClickHouse SSL config may live at properties.ssl, nested properties.properties.ssl,
     // the legacy `ssl.mode`, or the `clickhouse-ssl` handler block.
-    const nestedProps =
-      (connection.properties?.['properties'] as unknown as Record<string, unknown>) || {};
+    const nestedProps = getNestedDriverProps(connection);
     const sslHandler = (
       connection.properties?.['handlers'] as unknown as Record<string, unknown> | undefined
     )?.['clickhouse-ssl'] as Record<string, unknown> | undefined;
