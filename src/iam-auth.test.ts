@@ -5,6 +5,8 @@ import {
   resolveIamConnectionParams,
   classifyAwsAuthError,
   mintIamAuthToken,
+  isIamAuthEnabled,
+  getIamAuth,
   IamAuthError,
 } from './iam-auth.js';
 import type { DatabaseConnection } from './types.js';
@@ -227,6 +229,49 @@ describe('classifyAwsAuthError', () => {
 
   it('classifies an unknown error as TOKEN_MINT_FAILED', () => {
     expect(classifyAwsAuthError(new Error('connect ETIMEDOUT'))).toBe('TOKEN_MINT_FAILED');
+  });
+});
+
+describe('isIamAuthEnabled', () => {
+  it('defaults to enabled', () => {
+    expect(isIamAuthEnabled({})).toBe(true);
+  });
+
+  it('is disabled only by an explicit "false"', () => {
+    expect(isIamAuthEnabled({ OMNISQL_IAM_AUTH: 'false' })).toBe(false);
+    expect(isIamAuthEnabled({ OMNISQL_IAM_AUTH: 'true' })).toBe(true);
+    expect(isIamAuthEnabled({ OMNISQL_IAM_AUTH: '' })).toBe(true);
+  });
+});
+
+describe('getIamAuth', () => {
+  it('returns null for a stock Postgres connection', () => {
+    expect(getIamAuth(stockPgConn(), {})).toBeNull();
+  });
+
+  it('returns resolved params for an IAM connection with no stored password', () => {
+    expect(getIamAuth(pluginConn(), {})).toMatchObject({
+      profile: 'example-sso-profile',
+      region: 'us-east-2',
+    });
+  });
+
+  it('returns null when a stored password is present (stored password wins)', () => {
+    const conn = pluginConn();
+    (conn.properties as any).password = 'stored';
+    expect(getIamAuth(conn, {})).toBeNull();
+  });
+
+  it('returns null when IAM auth is disabled via env', () => {
+    expect(getIamAuth(pluginConn(), { OMNISQL_IAM_AUTH: 'false' })).toBeNull();
+  });
+
+  it('surfaces a config error (MISSING_USERNAME) for a misconfigured IAM connection', () => {
+    const conn = pluginConn({ user: undefined });
+    delete (conn.properties as any).user;
+    expect(() => getIamAuth(conn, {})).toThrowError(
+      expect.objectContaining({ kind: 'MISSING_USERNAME' })
+    );
   });
 });
 

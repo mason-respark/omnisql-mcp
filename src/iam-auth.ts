@@ -151,6 +151,29 @@ export function resolveIamConnectionParams(connection: DatabaseConnection): IamC
   return { profile, region, host, port, database, username, sslRootCert };
 }
 
+/** IAM auth is on unless explicitly disabled via OMNISQL_IAM_AUTH=false. */
+export function isIamAuthEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return env.OMNISQL_IAM_AUTH !== 'false';
+}
+
+/**
+ * Decide whether a Postgres-family connection should authenticate via IAM, and
+ * if so return the resolved params (the caller mints the token, so the minter
+ * stays a directly-imported export — important for both pooled and single-shot
+ * connection paths). Returns null when IAM is disabled, the connection is not an
+ * Aurora IAM connection, or a stored password already exists (stored wins).
+ * Throws IamAuthError when the connection is IAM but misconfigured.
+ */
+export function getIamAuth(
+  connection: DatabaseConnection,
+  env: Record<string, string | undefined> = process.env
+): IamConnectionParams | null {
+  if (!isIamAuthEnabled(env)) return null;
+  if (!isAuroraIamConnection(connection).isIam) return null;
+  if (readString(connection.properties?.password)) return null;
+  return resolveIamConnectionParams(connection);
+}
+
 /** Map an arbitrary AWS SDK / CLI error to an IamAuthErrorKind. */
 export function classifyAwsAuthError(error: unknown): IamAuthErrorKind {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
