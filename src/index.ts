@@ -20,6 +20,7 @@ import {
   convertToCSV,
   redactConnection,
   redactArgs,
+  readPrefixedEnv,
 } from './utils.js';
 import { IamAuthError, describeAuthRequired, runSsoLogin, getAwsProfile } from './iam-auth.js';
 import { ConnectionPoolManager } from './pools/index.js';
@@ -76,23 +77,23 @@ class OmniSQLMCPServer {
   private allowAnyOutputPath: boolean;
 
   constructor() {
-    this.debug = process.env.OMNISQL_DEBUG === 'true';
-    this.readOnly = process.env.OMNISQL_READ_ONLY === 'true';
-    this.disabledTools = (process.env.OMNISQL_DISABLED_TOOLS || '')
+    this.debug = readPrefixedEnv('DEBUG') === 'true';
+    this.readOnly = readPrefixedEnv('READ_ONLY') === 'true';
+    this.disabledTools = (readPrefixedEnv('DISABLED_TOOLS') || '')
       .split(',')
       .map((t) => t.trim())
       .filter(Boolean);
 
     // Parse allowed connections whitelist
-    const allowedRaw = process.env.OMNISQL_ALLOWED_CONNECTIONS || '';
+    const allowedRaw = readPrefixedEnv('ALLOWED_CONNECTIONS') || '';
     const allowedList = allowedRaw
       .split(',')
       .map((c) => c.trim())
       .filter(Boolean);
     this.allowedConnections = allowedList.length > 0 ? new Set(allowedList) : null;
 
-    this.outputDir = path.resolve(process.env.OMNISQL_OUTPUT_DIR || os.tmpdir());
-    this.allowAnyOutputPath = process.env.OMNISQL_ALLOW_ANY_OUTPUT_PATH === 'true';
+    this.outputDir = path.resolve(readPrefixedEnv('OUTPUT_DIR') || os.tmpdir());
+    this.allowAnyOutputPath = readPrefixedEnv('ALLOW_ANY_OUTPUT_PATH') === 'true';
 
     this.insightsFile = path.join(os.tmpdir(), 'omnisql-mcp-insights.json');
 
@@ -111,25 +112,25 @@ class OmniSQLMCPServer {
 
     this.configParser = new WorkspaceConfigParser({
       debug: this.debug,
-      timeout: parseInt(process.env.OMNISQL_TIMEOUT || '30000'),
-      executablePath: process.env.OMNISQL_CLI_PATH,
-      workspacePath: process.env.OMNISQL_WORKSPACE,
+      timeout: parseInt(readPrefixedEnv('TIMEOUT') || '30000'),
+      executablePath: readPrefixedEnv('CLI_PATH'),
+      workspacePath: readPrefixedEnv('WORKSPACE'),
     });
 
     this.workspaceClient = new WorkspaceClient(
-      process.env.OMNISQL_CLI_PATH,
-      parseInt(process.env.OMNISQL_TIMEOUT || '30000'),
+      readPrefixedEnv('CLI_PATH'),
+      parseInt(readPrefixedEnv('TIMEOUT') || '30000'),
       this.debug,
-      process.env.OMNISQL_WORKSPACE || this.configParser.getWorkspacePath()
+      readPrefixedEnv('WORKSPACE') || this.configParser.getWorkspacePath()
     );
 
     // Initialize connection pool and transaction manager
     this.poolManager = new ConnectionPoolManager(
       {
-        min: parseInt(process.env.OMNISQL_POOL_MIN || '2'),
-        max: parseInt(process.env.OMNISQL_POOL_MAX || '10'),
-        idleTimeoutMs: parseInt(process.env.OMNISQL_POOL_IDLE_TIMEOUT || '30000'),
-        acquireTimeoutMs: parseInt(process.env.OMNISQL_POOL_ACQUIRE_TIMEOUT || '10000'),
+        min: parseInt(readPrefixedEnv('POOL_MIN') || '2'),
+        max: parseInt(readPrefixedEnv('POOL_MAX') || '10'),
+        idleTimeoutMs: parseInt(readPrefixedEnv('POOL_IDLE_TIMEOUT') || '30000'),
+        acquireTimeoutMs: parseInt(readPrefixedEnv('POOL_ACQUIRE_TIMEOUT') || '10000'),
       },
       this.debug
     );

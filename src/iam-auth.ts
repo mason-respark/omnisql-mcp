@@ -10,7 +10,7 @@
  */
 import { spawn as nodeSpawn } from 'child_process';
 import type { DatabaseConnection } from './types.js';
-import { getNestedDriverProps } from './utils.js';
+import { getNestedDriverProps, readPrefixedEnv } from './utils.js';
 
 export type IamAuthErrorKind =
   | 'AUTH_REQUIRED'
@@ -148,7 +148,7 @@ export function resolveIamConnectionParams(connection: DatabaseConnection): IamC
 
 /** IAM auth is on unless explicitly disabled via OMNISQL_IAM_AUTH=false. */
 export function isIamAuthEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  return env.OMNISQL_IAM_AUTH !== 'false';
+  return readPrefixedEnv('IAM_AUTH', env) !== 'false';
 }
 
 /**
@@ -273,7 +273,7 @@ export interface SsoLoginResult {
 export function resolveSsoLoginTimeoutMs(
   env: Record<string, string | undefined> = process.env
 ): number {
-  const configured = Number(env.OMNISQL_SSO_LOGIN_TIMEOUT);
+  const configured = Number(readPrefixedEnv('SSO_LOGIN_TIMEOUT', env));
   return Number.isFinite(configured) && configured > 0 ? configured * 1000 : 180_000;
 }
 

@@ -11,6 +11,18 @@ export function getNestedDriverProps(connection: DatabaseConnection): Record<str
 }
 
 /**
+ * Read a config value, preferring the `OMNISQL_<suffix>` variable and falling
+ * back to the legacy `DBEAVER_<suffix>` name (this server was renamed from
+ * dbeaver-mcp-server, and existing configs still use the DBEAVER_ prefix).
+ */
+export function readPrefixedEnv(
+  suffix: string,
+  env: Record<string, string | undefined> = process.env
+): string | undefined {
+  return env[`OMNISQL_${suffix}`] ?? env[`DBEAVER_${suffix}`];
+}
+
+/**
  * Resolve the DB client CLI executable path.
  *
  * The CLI fallback is only used for drivers without a native implementation.
@@ -18,7 +30,7 @@ export function getNestedDriverProps(connection: DatabaseConnection): Record<str
  * Returns an empty string when not configured; callers must handle this case.
  */
 export function findCliExecutable(): string {
-  return process.env.OMNISQL_CLI_PATH ?? '';
+  return readPrefixedEnv('CLI_PATH') ?? '';
 }
 
 /**

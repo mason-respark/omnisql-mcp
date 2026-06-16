@@ -350,6 +350,10 @@ describe('isIamAuthEnabled', () => {
     expect(isIamAuthEnabled({ OMNISQL_IAM_AUTH: 'true' })).toBe(true);
     expect(isIamAuthEnabled({ OMNISQL_IAM_AUTH: '' })).toBe(true);
   });
+
+  it('honors the legacy DBEAVER_IAM_AUTH variable', () => {
+    expect(isIamAuthEnabled({ DBEAVER_IAM_AUTH: 'false' })).toBe(false);
+  });
 });
 
 describe('getIamAuth', () => {
