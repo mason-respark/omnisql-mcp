@@ -1,0 +1,317 @@
+import { describe, it, expect } from 'vitest';
+import {
+  isAuroraIamConnection,
+  parseRegionFromRdsHostname,
+  resolveIamConnectionParams,
+  classifyAwsAuthError,
+  mintIamAuthToken,
+  IamAuthError,
+} from './iam-auth.js';
+import type { DatabaseConnection } from './types.js';
+
+// A plugin-created Aurora IAM connection: no url / no wrapperPlugins persisted,
+// driver = aurora-postgresql, awsProfile lives in the nested `properties` map.
+function pluginConn(overrides: Partial<DatabaseConnection> = {}): DatabaseConnection {
+  return {
+    id: 'aurora-pg-1',
+    name: 'aurora_pg_prod',
+    driver: 'aurora-postgresql',
+    url: '',
+    host: 'infra-rdscluster-x.cluster-abc.us-east-2.rds.amazonaws.com',
+    port: 5432,
+    database: 'postgres',
+    user: 'app_user',
+    properties: {
+      properties: {
+        awsProfile: 'example-sso-profile',
+        iamRegion: 'us-east-2',
+        sslrootcert: '/home/me/.aws/rds-global-bundle.pem',
+      },
+    } as unknown as Record<string, string>,
+    ...overrides,
+  };
+}
+
+// A bootstrap-script-created connection: GUID driver, url = jdbc:aws-wrapper:…,
+// wrapperPlugins + awsProfile in nested props.
+function bootstrapConn(overrides: Partial<DatabaseConnection> = {}): DatabaseConnection {
+  return {
+    id: 'guid-1',
+    name: 'aurora-bootstrap',
+    driver: '27DA594F-326B-45B3-E2BC-637BBCA4777D',
+    url: 'jdbc:aws-wrapper:postgresql://infra-rdscluster-x.cluster-abc.us-east-2.rds.amazonaws.com:5432/postgres',
+    host: 'infra-rdscluster-x.cluster-abc.us-east-2.rds.amazonaws.com',
+    port: 5432,
+    database: 'postgres',
+    user: 'app_user',
+    properties: {
+      properties: {
+        wrapperPlugins: 'iam',
+        awsProfile: 'example-sso-profile',
+        iamRegion: 'us-east-2',
+      },
+    } as unknown as Record<string, string>,
+    ...overrides,
+  };
+}
+
+function stockPgConn(): DatabaseConnection {
+  return {
+    id: 'pg-1',
+    name: 'plain-pg',
+    driver: 'postgres-jdbc',
+    url: 'jdbc:postgresql://db.example.com:5432/app',
+    host: 'db.example.com',
+    port: 5432,
+    database: 'app',
+    user: 'app',
+    properties: { password: 'hunter2', sslmode: 'require' },
+  };
+}
+
+describe('isAuroraIamConnection', () => {
+  it('detects a plugin-created Aurora IAM connection via nested awsProfile', () => {
+    expect(isAuroraIamConnection(pluginConn())).toEqual({ isIam: true, engine: 'postgres' });
+  });
+
+  it('detects a bootstrap-created connection via nested awsProfile', () => {
+    expect(isAuroraIamConnection(bootstrapConn())).toEqual({ isIam: true, engine: 'postgres' });
+  });
+
+  it('derives the mysql engine from an aurora-mysql driver', () => {
+    const conn = pluginConn({ driver: 'aurora-mysql' });
+    expect(isAuroraIamConnection(conn)).toEqual({ isIam: true, engine: 'mysql' });
+  });
+
+  it('derives the engine from the jdbc:aws-wrapper url scheme when the driver is a GUID', () => {
+    const conn = bootstrapConn({
+      url: 'jdbc:aws-wrapper:mysql://host.us-east-2.rds.amazonaws.com:3306/app',
+    });
+    expect(isAuroraIamConnection(conn)).toEqual({ isIam: true, engine: 'mysql' });
+  });
+
+  it('returns isIam=false for a stock Postgres connection (no awsProfile)', () => {
+    expect(isAuroraIamConnection(stockPgConn())).toEqual({ isIam: false, engine: null });
+  });
+
+  it('treats a blank awsProfile as not-IAM', () => {
+    const conn = pluginConn();
+    (conn.properties as any).properties.awsProfile = '   ';
+    expect(isAuroraIamConnection(conn).isIam).toBe(false);
+  });
+});
+
+describe('parseRegionFromRdsHostname', () => {
+  it('extracts the region from a cluster endpoint', () => {
+    expect(
+      parseRegionFromRdsHostname('infra-rdscluster-x.cluster-abc.us-east-2.rds.amazonaws.com')
+    ).toBe('us-east-2');
+  });
+
+  it('extracts the region from a plain instance endpoint', () => {
+    expect(parseRegionFromRdsHostname('mydb.abc123.eu-west-1.rds.amazonaws.com')).toBe('eu-west-1');
+  });
+
+  it('extracts a gov-cloud region', () => {
+    expect(parseRegionFromRdsHostname('mydb.abc.us-gov-west-1.rds.amazonaws.com')).toBe(
+      'us-gov-west-1'
+    );
+  });
+
+  it('extracts a China-partition region (.com.cn endpoint)', () => {
+    expect(parseRegionFromRdsHostname('mydb.abc.cn-north-1.rds.amazonaws.com.cn')).toBe(
+      'cn-north-1'
+    );
+  });
+
+  it('extracts a multi-segment region label', () => {
+    expect(parseRegionFromRdsHostname('mydb.abc.us-iso-east-1.rds.amazonaws.com')).toBe(
+      'us-iso-east-1'
+    );
+  });
+
+  it('returns null for a non-RDS hostname', () => {
+    expect(parseRegionFromRdsHostname('localhost')).toBeNull();
+    expect(parseRegionFromRdsHostname('db.internal.corp')).toBeNull();
+  });
+});
+
+describe('resolveIamConnectionParams', () => {
+  it('resolves all params from a plugin connection', () => {
+    const params = resolveIamConnectionParams(pluginConn());
+    expect(params).toEqual({
+      profile: 'example-sso-profile',
+      region: 'us-east-2',
+      host: 'infra-rdscluster-x.cluster-abc.us-east-2.rds.amazonaws.com',
+      port: 5432,
+      database: 'postgres',
+      username: 'app_user',
+      sslRootCert: '/home/me/.aws/rds-global-bundle.pem',
+    });
+  });
+
+  it('falls back to the region parsed from the hostname when iamRegion is absent', () => {
+    const conn = pluginConn();
+    delete (conn.properties as any).properties.iamRegion;
+    expect(resolveIamConnectionParams(conn).region).toBe('us-east-2');
+  });
+
+  it('throws PROFILE_NOT_FOUND when awsProfile is missing', () => {
+    const conn = pluginConn();
+    delete (conn.properties as any).properties.awsProfile;
+    expect(() => resolveIamConnectionParams(conn)).toThrowError(
+      expect.objectContaining({ kind: 'PROFILE_NOT_FOUND' })
+    );
+  });
+
+  it('throws MISSING_USERNAME when no DB user is known', () => {
+    const conn = pluginConn({ user: undefined });
+    delete (conn.properties as any).user;
+    expect(() => resolveIamConnectionParams(conn)).toThrowError(
+      expect.objectContaining({ kind: 'MISSING_USERNAME' })
+    );
+  });
+
+  it('uses MySQL defaults (port 3306) for an aurora-mysql connection without an explicit port', () => {
+    const conn = pluginConn({ driver: 'aurora-mysql', port: undefined });
+    const params = resolveIamConnectionParams(conn);
+    expect(params.port).toBe(3306);
+  });
+
+  it('does not force the postgres database name for a MySQL connection', () => {
+    const conn = pluginConn({ driver: 'aurora-mysql', port: undefined, database: undefined });
+    expect(resolveIamConnectionParams(conn).database).toBe('');
+  });
+
+  it('falls back to the default port when properties.port is non-numeric', () => {
+    const conn = pluginConn({ port: undefined });
+    (conn.properties as any).port = 'not-a-number';
+    expect(resolveIamConnectionParams(conn).port).toBe(5432);
+  });
+
+  it('throws REGION_UNKNOWN when region is neither configured nor derivable', () => {
+    const conn = pluginConn({ host: 'db.internal.corp' });
+    delete (conn.properties as any).properties.iamRegion;
+    expect(() => resolveIamConnectionParams(conn)).toThrowError(
+      expect.objectContaining({ kind: 'REGION_UNKNOWN' })
+    );
+  });
+});
+
+describe('classifyAwsAuthError', () => {
+  it('classifies an expired SSO session as AUTH_REQUIRED', () => {
+    expect(
+      classifyAwsAuthError(
+        new Error(
+          'The SSO session associated with this profile has expired or is otherwise invalid. To refresh this SSO session run aws sso login with the corresponding profile.'
+        )
+      )
+    ).toBe('AUTH_REQUIRED');
+  });
+
+  it('classifies an expired token as AUTH_REQUIRED', () => {
+    expect(classifyAwsAuthError(new Error('Token is expired'))).toBe('AUTH_REQUIRED');
+  });
+
+  it('classifies a reauthenticate hint as AUTH_REQUIRED', () => {
+    expect(classifyAwsAuthError(new Error('Please reauthenticate by running aws sso login'))).toBe(
+      'AUTH_REQUIRED'
+    );
+  });
+
+  it('classifies a missing profile as PROFILE_NOT_FOUND', () => {
+    expect(classifyAwsAuthError(new Error("Profile `example-sso-profile' could not be found"))).toBe(
+      'PROFILE_NOT_FOUND'
+    );
+  });
+
+  it('classifies an unknown error as TOKEN_MINT_FAILED', () => {
+    expect(classifyAwsAuthError(new Error('connect ETIMEDOUT'))).toBe('TOKEN_MINT_FAILED');
+  });
+});
+
+describe('mintIamAuthToken', () => {
+  const params = {
+    profile: 'example-sso-profile',
+    region: 'us-east-2',
+    host: 'host.us-east-2.rds.amazonaws.com',
+    port: 5432,
+    database: 'postgres',
+    username: 'app_user',
+  };
+
+  it('returns the token produced by the signer', async () => {
+    const token = await mintIamAuthToken(params, {
+      loadCredentials: () => ({ accessKeyId: 'AK', secretAccessKey: 'SK' }) as any,
+      createSigner: (opts) => {
+        expect(opts.hostname).toBe(params.host);
+        expect(opts.username).toBe(params.username);
+        expect(opts.region).toBe(params.region);
+        return { getAuthToken: async () => 'minted-token-123' };
+      },
+    });
+    expect(token).toBe('minted-token-123');
+  });
+
+  it('raises an AUTH_REQUIRED IamAuthError when the SSO session is expired', async () => {
+    await expect(
+      mintIamAuthToken(params, {
+        loadCredentials: () => {
+          throw new Error('Token is expired and refresh failed');
+        },
+        createSigner: () => ({ getAuthToken: async () => 'never' }),
+      })
+    ).rejects.toMatchObject({ kind: 'AUTH_REQUIRED', profile: 'example-sso-profile' });
+  });
+
+  it('classifies an SSO error thrown from getAuthToken (the real lazy-credential path) as AUTH_REQUIRED', async () => {
+    await expect(
+      mintIamAuthToken(params, {
+        loadCredentials: () => ({ accessKeyId: 'AK', secretAccessKey: 'SK' }) as any,
+        createSigner: () => ({
+          getAuthToken: async () => {
+            throw new Error(
+              'The SSO session associated with this profile has expired or is otherwise invalid.'
+            );
+          },
+        }),
+      })
+    ).rejects.toMatchObject({ kind: 'AUTH_REQUIRED', profile: 'example-sso-profile' });
+  });
+
+  it('does not misclassify an unrelated certificate-expiry error as AUTH_REQUIRED', async () => {
+    await expect(
+      mintIamAuthToken(params, {
+        loadCredentials: () => ({ accessKeyId: 'AK', secretAccessKey: 'SK' }) as any,
+        createSigner: () => ({
+          getAuthToken: async () => {
+            throw new Error('certificate has expired');
+          },
+        }),
+      })
+    ).rejects.toMatchObject({ kind: 'TOKEN_MINT_FAILED' });
+  });
+
+  it('raises a TOKEN_MINT_FAILED IamAuthError when the signer fails for an unrelated reason', async () => {
+    await expect(
+      mintIamAuthToken(params, {
+        loadCredentials: () => ({ accessKeyId: 'AK', secretAccessKey: 'SK' }) as any,
+        createSigner: () => ({
+          getAuthToken: async () => {
+            throw new Error('network unreachable');
+          },
+        }),
+      })
+    ).rejects.toMatchObject({ kind: 'TOKEN_MINT_FAILED' });
+  });
+
+  it('produces an IamAuthError instance', async () => {
+    const err = await mintIamAuthToken(params, {
+      loadCredentials: () => {
+        throw new Error('Token is expired');
+      },
+      createSigner: () => ({ getAuthToken: async () => 'x' }),
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(IamAuthError);
+  });
+});
